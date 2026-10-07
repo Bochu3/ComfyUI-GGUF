@@ -224,6 +224,35 @@ class GGMLLayer(torch.nn.Module):
     def forward_ggml_cast_weights(self, input):
         raise NotImplementedError
 
+def _swiglu(x):
+    gate, up = x.chunk(2, dim=-1)
+    return torch.nn.functional.silu(gate) * up
+
+FALLBACK_INPUT_ACT = {
+    "swiglu": _swiglu,
+    "gelu_tanh": lambda x: torch.nn.functional.gelu(x, approximate="tanh"),
+}
+
+def linear_input_act(input, weight, bias, input_act=None, act_weight=None, act_eps=0.0,
+                     residual=None, residual_scale=None):
+    """
+    Dequantized-weight version of core's fused `Linear.forward(input_act=..., residual=...)`.
+    Prefer core's own implementation so the math matches exactly; the fallback only
+    covers the activations core had when this API was introduced, in case it moves.
+    """
+    core_impl = getattr(comfy.ops, "linear_input_act_", None)
+    if core_impl is not None:
+        return core_impl(input, weight, bias, input_act, act_weight, act_eps, residual, residual_scale)
+
+    if input_act is not None:
+        if input_act not in FALLBACK_INPUT_ACT:
+            raise NotImplementedError(f"GGUF Linear: unsupported input_act '{input_act}' for this ComfyUI version")
+        input = FALLBACK_INPUT_ACT[input_act](input)
+    out = torch.nn.functional.linear(input, weight, bias)
+    if residual is not None:
+        out = torch.addcmul(residual, out, residual_scale)
+    return out
+
 class GGMLOps(comfy.ops.manual_cast):
     """
     Dequantize weights on the fly before doing the compute
@@ -239,9 +268,14 @@ class GGMLOps(comfy.ops.manual_cast):
             self.weight = None
             self.bias = None
 
-        def forward_ggml_cast_weights(self, input):
+        def forward_ggml_cast_weights(self, input, input_act=None, act_weight=None, act_eps=0.0,
+                                      residual=None, residual_scale=None):
+            # Newer comfy core passes fused-op args through Linear.forward:
+            # `linear(act(input))`, optionally `residual + residual_scale * linear(...)`.
             weight, bias = self.cast_bias_weight(input)
-            return torch.nn.functional.linear(input, weight, bias)
+            if input_act is None and residual is None:
+                return torch.nn.functional.linear(input, weight, bias)
+            return linear_input_act(input, weight, bias, input_act, act_weight, act_eps, residual, residual_scale)
 
     class Conv2d(GGMLLayer, comfy.ops.manual_cast.Conv2d):
         def forward_ggml_cast_weights(self, input):
